@@ -1,2 +1,270 @@
-test
-Testing git functionalities
+
+---
+- name: 0 Print message if ansible version is greater than 2.9.3
+  debug:
+      msg: "Ansible version is  {{ ansible_version.full }}"
+  when: ansible_version.full >= "2.9.3"
+
+- name: 1 Bitbucket {{ bitbucket_version }}| Display all variables/facts known for a host
+  debug:
+    var: hostvars[inventory_hostname]
+    verbosity: 4
+  tags:
+    - display_facts
+
+- name: 2 Bitbucket {{ bitbucket_version }}| Create timestamp for backup files
+  shell: date +%s
+  check_mode: no
+  register: timestamp
+  run_once: true
+  tags:
+    - copy_files
+    - create_properties
+
+# Enable yum to install dependend packages from our artifactory
+# Status: verified by bck2fe
+# Copy and Activate the artifactory.repo to have access via YUM
+- name: 3 Bitbucket {{ bitbucket_version }}| Activate Artifactory repository
+  copy:
+    src: ./../../bitbucket-master/files/artifactory.repo
+    dest: /etc/yum.repos.d/
+    owner: root
+    group: root
+    directory_mode: 755
+    mode: 0644
+  tags:
+    - check_yum
+# SOCOPL-1286
+# Install all depended RPM packages with YUM
+- name: 4 Bitbucket {{ bitbucket_version }}| Install dependencies
+  yum:
+    name: "{{ bitbucket_dependencies }}"
+    state: present
+  ignore_errors: "{{ ansible_check_mode }}"
+  tags:
+    - check_yum
+
+# Check that the group rb_atlbitbucket_ua exists
+- name: 5 Bitbucket {{ bitbucket_version }}| Ensure bitbucket group {{ ansible_bitbucket_group }} exists
+  group:
+    name: "{{ ansible_bitbucket_group }}"
+
+# Check that the user atlbitbucket exist
+- name: 6 Bitbucket {{ bitbucket_version }}| Ensure bitbucket user {{ ansible_bitbucket_user }} exists
+  user:
+    name: "{{ ansible_bitbucket_user }}"
+    group: "{{ ansible_bitbucket_group }}"
+    shell: /bin/bash
+#
+# check if same version is already installed in
+# /opt/atlassian/atlassian-bitbucket-X.YY.Z/
+- name: 7 Bitbucket {{ bitbucket_version }}| Check if {{ bitbucket_install_dir }}/atlassian-bitbucket-{{ bitbucket_version }} exists
+  stat: path={{ bitbucket_install_dir }}/atlassian-bitbucket-{{ bitbucket_version }}
+  register: Version
+
+- name: 8 Bitbucket {{ bitbucket_version }}| Move existing atlassian-bitbucket-{{ bitbucket_version }} to atlassian-bitbucket-{{ bitbucket_version }}-{{ timestamp.stdout }}
+  command: mv {{ bitbucket_install_dir }}/atlassian-bitbucket-{{ bitbucket_version }} {{ bitbucket_install_dir }}/atlassian-bitbucket-{{ bitbucket_version }}-{{ timestamp.stdout }}
+  when: Version.stat.exists == true
+#
+# Create new needed directories
+- name: 9 Bitbucket {{ bitbucket_version }}| Ensure special script and java directory exist
+  file:
+    path: "{{ item }}"
+    owner: root
+    group: root
+    mode: 0755
+    state: directory
+  with_items:
+    - '/usr/share/scripts'
+    - '/usr/java'
+
+# Create initial needed root folder(s)
+#bitbucket_install_dir: /opt/atlassian
+#bitbucket_home_dir:  /var/atlassian/application-data/bitbucket
+#bitbucket_share_dir: /var/atlassian/application/bitbucket/shared
+
+- name: 10 Bitbucket {{ bitbucket_version }}| Ensure main bitbucket root dirs exists
+  file:
+    path: "{{ item }}"
+    owner: "{{ ansible_bitbucket_user }}"
+    group: "{{ ansible_bitbucket_group }}"
+    mode: 0755
+    state: directory
+  with_items:
+    - "{{ bitbucket_install_dir }}"
+    - "{{ bitbucket_home_dir }}"
+  when: Version.stat.exists == false
+  check_mode: no
+
+# Dowload TAR archive from artifiactory
+- name: 11 Bitbucket {{ bitbucket_version }}| Download from Jfrog
+  delegate_to: localhost
+  get_url:
+    url: https://rb-artifactory.bosch.com/artifactory/list/sde-applications-local/bitbucket_dc/{{bitbucket_version}}/atlassian-bitbucket-{{bitbucket_version}}.tar.gz
+    dest: /opt/download-rpm/atlassian-bitbucket-{{bitbucket_version}}.tar.gz
+    url_username: "{{ bitbucket_adm_user }}"
+    url_password: "{{ bitbucket_adm_pw }}"
+  run_once: true
+  check_mode: no
+
+# Copy TAR archive to each host
+- name: 12 Bitbucket {{ bitbucket_version }}| Copy atlassian-bitbucket package to hosts
+  copy:
+    src: "/opt/download-rpm/atlassian-bitbucket-{{ bitbucket_version }}.tar.gz"
+    dest: "{{ bitbucket_install_dir }}/atlassian-bitbucket-{{ bitbucket_version }}.tar.gz"
+    owner: "{{ ansible_bitbucket_user }}"
+    group: "{{ ansible_bitbucket_group }}"
+    mode: 0777
+  check_mode: no
+
+# Status: verified by bck2fe
+# Check the MD5 checksum after the TAR archive was copied
+- name: 13 Bitbucket {{ bitbucket_version }}| Get the MD5 checksumm of the file /opt/atlassian/atlassian-bitbucket-{{ bitbucket_version }}.tar.gz
+  stat:
+     path: "{{ bitbucket_install_dir }}/atlassian-bitbucket-{{ bitbucket_version }}.tar.gz"
+     checksum_algorithm: md5
+  register: st
+
+# Extract TAR archive if MD5 checksum is ok
+- name: 14 Bitbucket {{ bitbucket_version }}| Extract archive in {{ bitbucket_install_dir }} MD5 is {{ bitbucket_tar_checksum }}
+  unarchive:
+    src: "{{ bitbucket_install_dir }}/atlassian-bitbucket-{{ bitbucket_version }}.tar.gz"
+    dest: "{{ bitbucket_install_dir }}"
+    remote_src: yes
+  when:
+    - st.stat.checksum == bitbucket_tar_checksum
+
+#  notify: restart bitbucket
+# Change the permissions recursivly
+- name: 15 Bitbucket {{ bitbucket_version }}| Change permissions recursive inside of {{ bitbucket_install_dir }}
+  file:
+    path: "{{ bitbucket_install_dir }}/atlassian-bitbucket-{{ bitbucket_version }}"
+    owner: "{{ ansible_bitbucket_user }}"
+    group: "{{ ansible_bitbucket_group }}"
+    recurse: yes
+
+# Delete archive 
+- name: 16 Bitbucket {{ bitbucket_version }}| Remove local BB TAR archive
+  file:
+    path: /opt/download-rpm/atlassian-bitbucket-{{ bitbucket_version }}.tar.gz
+    state: absent
+
+# Delete archieve from localhost
+- name: 17 Bitbucket {{ bitbucket_version }}| Remove Archive TAR from hosts
+  file:
+    path: "{{ bitbucket_install_dir }}/atlassian-bitbucket-{{ bitbucket_version }}.tar.gz"
+    state: absent
+    owner: "{{ ansible_bitbucket_user }}"
+    group: "{{ ansible_bitbucket_group }}"
+    mode: 0777
+  check_mode: no
+#
+# SOCOPL-830: Set JAVA_HOME variable after reboot
+# SOCOPL-966: Create REST CALL Counter file
+#Copy log files from roles/bitbucket-master/files
+- name: 18 Bitbucket {{ bitbucket_version }}| Copy atlassian-bitbucket logrotate files and other needed files to host
+  copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    directory_mode: 755
+    mode: "{{ item.mode }}"
+    backup: yes
+  with_items:
+    - { src: '../../bitbucket-master/files/rb_atlassian_access_log_https_error_log' , dest: "{{ bitbucket_logfiles_dest }}" , mode: '0644'}
+    - { src: '../../bitbucket-master/files/rb_atlassian_access_log_clones_log' , dest: "{{ bitbucket_logfiles_dest }}" , mode: '0644'}
+    - { src: '../../bitbucket-master/files/AuthenticationFailureEvent_log' , dest: "{{ bitbucket_logfiles_dest }}" , mode: '0644'}
+    - { src: '../../bitbucket-master/files/my_nfsiostat_log' , dest: "{{ bitbucket_logfiles_dest }}" , mode: '0644'}
+    - { src: '../../bitbucket-master/files/crontab' , dest: '/etc/' , mode: '0644'}
+    - { src: '../../bitbucket-master/files/my_nfsiostat' , dest: '/usr/share/scripts/' , mode: '0755'}
+    - { src: '../../bitbucket-master/files/count_rest_calls_per_minute.py' , dest: '/usr/share/scripts/' , mode: '0755'}
+    - { src: '../../bitbucket-master/files/java.csh' , dest: '/etc/profile.d/' , mode: '0755'}
+    - { src: '../../bitbucket-master/files/java.sh' , dest: '/etc/profile.d/' , mode: '0755'}
+    - { src: '../../bitbucket-master/files/nfs_monitoring.sh' , dest: '/usr/share/scripts' , mode: '0755'}
+    - { src: '../../bitbucket-master/files/AuthenticationFailureEvent.sh' , dest: '/usr/share/scripts' , mode: '0755'}
+    - { src: '../../bitbucket-master/files/rc.local' , dest: '/etc/rc.d/' , mode: '0755'}
+    - { src: '../../bitbucket-master/files/rb_keys/BOSCH-CA-DE_pem.cer' , dest: "{{ bosch_root_certificate }}" , mode: '0600'}
+    - { src: '../../bitbucket-master/files/rb_keys/BOSCH-CA-DE_pem.cer' , dest: "{{ bosch_intermediate_certificate }}" , mode: '0600'}
+  become_method: sudo
+  tags:
+    - copy_files
+#
+# SOCOPL-1133: modules to check for iptable file
+- name: 19 Check for {{ ansible_system_type }}-iptables
+  stat:
+    path: "{{ playbook_dir }}/roles/bitbucket-master/files/{{ ansible_system_type }}-iptables"
+  delegate_to: localhost
+  register: ipt
+  tags:
+    - iptables
+    - iptables_check
+
+- name: 20 fail if {{ ansible_system_type }}-iptables doesn´t exist
+  fail:
+    msg: "ERROR The {{ ansible_system_type }}-iptables doesn´t exist!"
+  when: 
+    - not ipt.stat.exists and bitbucket_mirror_server == false
+  ignore_errors: "{{ ansible_check_mode }}"
+  tags:
+    - iptables
+    - iptables_check
+#
+# SOCOPL-1133: module to copy iptable configuration to hosts
+- name: 21 Bitbucket {{ bitbucket_version }}| Copy {{ ansible_system_type }}-iptables to hosts
+  copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    directory_mode: 755
+    mode: 0600
+    force: yes
+    backup: yes
+  with_items:
+    - { src: '../../bitbucket-master/files/{{ ansible_system_type }}-iptables' , dest: '/etc/sysconfig/iptables' }
+  become_method: sudo
+  become_user: root
+  when:
+    - bitbucket_mirror_server == false
+  tags:
+    - copy_files
+    - iptables
+#
+# SOCOPL-1005: Create some more needed directories
+- name: 22 Bitbucket {{ bitbucket_version }}| Create rb_keys directory
+  file:
+    path: "{{ item }}"
+    owner: "{{ ansible_bitbucket_user }}"
+    group: "{{ ansible_bitbucket_group }}"
+    mode: 0755
+    state: directory
+    force: yes
+  with_items:
+    - "{{ bitbucket_common_share }}/rb_keys"
+  tags:
+    - create_log_dir
+#
+# SOCOPL-1005: Copy rb_keys files 
+- name: 23 Bitbucket {{ bitbucket_version }}| Copy rb_keys files to shared folder
+  copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: "{{ ansible_bitbucket_user }}"
+    group: "{{ ansible_bitbucket_group }}"
+    directory_mode: 755
+    mode: "{{ item.mode }}"
+    backup: yes
+  with_items:
+    - { src: '../../bitbucket-master/files/rb_keys/bitbucket.jks' , dest: "{{ bitbucket_common_share }}/rb_keys/bitbucket.jks" , mode: '0644'}
+    - { src: '../../bitbucket-master/files/rb_keys/jmx.access' , dest: "{{ bitbucket_common_share }}/rb_keys/jmx.access" , mode: '0600'}
+  become_method: sudo
+  tags:
+    - copy_files
+#
+# SOCOPL-830: must delete that the server hardening works
+# Delete copied artifactory.repo file
+- name: 24 Bitbucket {{ bitbucket_version }}| Remove local Artifactory repository file
+  file:
+    path: /etc/yum.repos.d/artifactory.repo
+    state: absent
